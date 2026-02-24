@@ -911,3 +911,9 @@ def get_confluence() -> ConfluenceScore:
     mtf_trends = [structure["trend"], analyze_market_structure(df_daily)["trend"]]
     confluence = compute_confluence_score(structure, obs, fvgs, liq, session, mtf_trends)
     return ConfluenceScore(**confluence)
+
+
+@app.get("/health", tags=["Health"])
+def health_check() -> dict:
+    """Health check endpoint."""
+    return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
