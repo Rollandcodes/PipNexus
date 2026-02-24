@@ -77,6 +77,75 @@ function ScoreRow({ label, pts, max }) {
   )
 }
 
+// ── SMT Divergence tab ───────────────────────────────────────────────────
+function SMTTab({ data, loading, error }) {
+  if (loading) return <Spinner />
+  if (error)   return <ErrorBanner msg={error} />
+  if (!data)   return <div className="empty-state">No SMT divergence data.</div>
+
+  const TYPE_CLASS = { bullish: 'bull', bearish: 'bear' }
+  const typeClass = TYPE_CLASS[data.type] || ''
+
+  return (
+    <div>
+      <div className="ms-header" style={{ marginBottom: 16 }}>
+        <span className={`tag ${typeClass}`}>{data.type.toUpperCase()}</span>
+        <span className={`tag ${data.strength === 'strong' ? 'strong' : ''}`} style={{ marginLeft: 8 }}>
+          {data.strength}
+        </span>
+      </div>
+      <div style={{ fontSize: 13, color: 'var(--text-primary)', marginBottom: 16 }}>{data.message}</div>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+        <div style={{ background: 'var(--bg-secondary)', borderRadius: 8, padding: '10px 12px' }}>
+          <div style={{ fontSize: 10, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 4 }}>XAUUSD High</div>
+          <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--bear)' }}>{fmt(data.gold_high)}</div>
+        </div>
+        <div style={{ background: 'var(--bg-secondary)', borderRadius: 8, padding: '10px 12px' }}>
+          <div style={{ fontSize: 10, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 4 }}>XAUUSD Low</div>
+          <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--bull)' }}>{fmt(data.gold_low)}</div>
+        </div>
+        <div style={{ background: 'var(--bg-secondary)', borderRadius: 8, padding: '10px 12px' }}>
+          <div style={{ fontSize: 10, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 4 }}>DXY High</div>
+          <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--bear)' }}>{data.dxy_high?.toFixed(3)}</div>
+        </div>
+        <div style={{ background: 'var(--bg-secondary)', borderRadius: 8, padding: '10px 12px' }}>
+          <div style={{ fontSize: 10, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 4 }}>DXY Low</div>
+          <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--bull)' }}>{data.dxy_low?.toFixed(3)}</div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── Breaker Blocks table ─────────────────────────────────────────────────
+function BreakerBlocksTab({ data, loading, error }) {
+  if (loading) return <Spinner />
+  if (error)   return <ErrorBanner msg={error} />
+  if (!data?.length) return <div className="empty-state">No Breaker Blocks detected.</div>
+
+  return (
+    <table className="ict-table">
+      <thead>
+        <tr>
+          <th>Type</th><th>High</th><th>Mid</th><th>Low</th><th>Strength</th><th>Converted From</th>
+        </tr>
+      </thead>
+      <tbody>
+        {data.map((bb) => (
+          <tr key={bb.id}>
+            <td><span className={`tag ${bb.type === 'bullish' ? 'bull' : 'bear'}`}>{bb.type}</span></td>
+            <td>{fmt(bb.price_high)}</td>
+            <td>{fmt(bb.price_mid)}</td>
+            <td>{fmt(bb.price_low)}</td>
+            <td><span className="tag strong">{bb.strength}</span></td>
+            <td style={{ fontSize: 11, color: 'var(--text-muted)' }}>{bb.converted_from.replace(/_/g, ' ')}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  )
+}
+
 // ── Order Blocks table ───────────────────────────────────────────────────
 function OrderBlocksTab({ data, loading, error }) {
   if (loading) return <Spinner />
@@ -296,6 +365,7 @@ const SCORE_MAX = {
   order_block:     2,
   fair_value_gap:  2,
   liquidity_sweep: 2,
+  smt_divergence:  2,
   kill_zone:       1,
 }
 
@@ -323,7 +393,7 @@ function ConfluenceCard({ data, loading, error }) {
 }
 
 // ── ICT Tabbed Panel ─────────────────────────────────────────────────────
-const TABS = ['Order Blocks', 'FVG', 'Liquidity', 'Market Structure', 'Multi-Timeframe']
+const TABS = ['Order Blocks', 'FVG', 'Liquidity', 'Market Structure', 'Multi-Timeframe', 'SMT Divergence', 'Breaker Blocks']
 
 function ICTPanel({ ictData, loading, errors }) {
   const [active, setActive] = useState(0)
@@ -347,6 +417,8 @@ function ICTPanel({ ictData, loading, errors }) {
         {active === 2 && <LiquidityTab     data={ictData.liquidity}        loading={loading.liquidity}        error={errors.liquidity} />}
         {active === 3 && <MarketStructureTab data={ictData.marketStructure} loading={loading.marketStructure}  error={errors.marketStructure} />}
         {active === 4 && <MTFTab           data={ictData.mtf}              loading={loading.mtf}              error={errors.mtf} />}
+        {active === 5 && <SMTTab           data={ictData.smt}              loading={loading.smt}              error={errors.smt} />}
+        {active === 6 && <BreakerBlocksTab data={ictData.breakerBlocks}    loading={loading.breakerBlocks}    error={errors.breakerBlocks} />}
       </div>
     </div>
   )
@@ -364,17 +436,20 @@ export default function App() {
   const [confluence, setConfluence] = useState(null)
 
   const [ictData, setIctData] = useState({
-    orderBlocks: null, fvg: null, liquidity: null, marketStructure: null, mtf: null
+    orderBlocks: null, fvg: null, liquidity: null, marketStructure: null, mtf: null,
+    smt: null, breakerBlocks: null
   })
 
   const [loading, setLoading] = useState({
     price: true, signal: true, confluence: true,
-    orderBlocks: true, fvg: true, liquidity: true, marketStructure: true, mtf: true
+    orderBlocks: true, fvg: true, liquidity: true, marketStructure: true, mtf: true,
+    smt: true, breakerBlocks: true
   })
 
   const [errors, setErrors] = useState({
     price: null, signal: null, confluence: null,
-    orderBlocks: null, fvg: null, liquidity: null, marketStructure: null, mtf: null
+    orderBlocks: null, fvg: null, liquidity: null, marketStructure: null, mtf: null,
+    smt: null, breakerBlocks: null
   })
 
   const [lastUpdate, setLastUpdate] = useState(null)
@@ -438,6 +513,8 @@ export default function App() {
       { key: 'liquidity',       path: '/ict/liquidity' },
       { key: 'marketStructure', path: '/ict/market-structure' },
       { key: 'mtf',             path: '/analysis/multi-timeframe' },
+      { key: 'smt',             path: '/ict/smt-divergence' },
+      { key: 'breakerBlocks',   path: '/ict/breaker-blocks' },
     ]
     for (const { key, path } of endpoints) {
       setL(key, true)

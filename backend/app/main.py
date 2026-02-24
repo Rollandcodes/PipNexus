@@ -46,6 +46,7 @@ app.add_middleware(
 # Constants
 # ---------------------------------------------------------------------------
 TICKER = "GC=F"   # Gold futures on Yahoo Finance
+DXY_TICKER = "DX-Y.NYB"  # US Dollar Index (inversely correlated with gold)
 
 # Session windows (UTC hours, inclusive start / exclusive end)
 SESSIONS: dict[str, tuple[int, int]] = {
@@ -172,6 +173,28 @@ class ConfluenceScore(BaseModel):
     rating: str             # "Strong" | "Moderate" | "Weak" | "No Signal"
 
 
+class SMTDivergenceResponse(BaseModel):
+    type: str               # "bullish" | "bearish" | "none"
+    strength: str           # "strong" | "weak"
+    message: str
+    gold_high: float
+    gold_low: float
+    dxy_high: float
+    dxy_low: float
+    timestamp: str
+
+
+class BreakerBlock(BaseModel):
+    id: str
+    type: str               # "bullish" | "bearish"
+    price_high: float
+    price_low: float
+    price_mid: float
+    strength: str           # "high" | "moderate"
+    timestamp: str
+    converted_from: str     # "bullish_ob" | "bearish_ob"
+
+
 # ---------------------------------------------------------------------------
 # Data fetching helpers
 # ---------------------------------------------------------------------------
@@ -182,14 +205,29 @@ def fetch_ohlc(period: str = "5d", interval: str = "1h") -> pd.DataFrame:
     Returns a clean DataFrame with columns: open, high, low, close, volume.
     Raises HTTPException on failure.
     """
+    return fetch_ohlc_ticker(TICKER, period=period, interval=interval)
+
+
+def fetch_ohlc_ticker(ticker_symbol: str, period: str = "5d", interval: str = "1h") -> pd.DataFrame:
+    """
+    Download OHLC data from Yahoo Finance for any ticker.
+    Returns a clean DataFrame with columns: open, high, low, close, volume.
+    Raises HTTPException on failure.
+    """
     try:
-        ticker = yf.Ticker(TICKER)
+        ticker = yf.Ticker(ticker_symbol)
         df = ticker.history(period=period, interval=interval)
         if df.empty:
             raise ValueError("Empty dataframe returned from yfinance")
 
         # Normalise column names
         df.columns = [c.lower() for c in df.columns]
+        # Keep only OHLCV; DXY does not have volume – fill with 0
+        for col in ["open", "high", "low", "close"]:
+            if col not in df.columns:
+                raise ValueError(f"Missing column: {col}")
+        if "volume" not in df.columns:
+            df["volume"] = 0.0
         df = df[["open", "high", "low", "close", "volume"]].dropna()
 
         # Ensure UTC-aware index
@@ -512,6 +550,124 @@ def get_current_session() -> dict[str, Any]:
     }
 
 
+def detect_smt_divergence(
+    gold_df: pd.DataFrame,
+    dxy_df: pd.DataFrame,
+    lookback: int = 10,
+) -> dict[str, Any]:
+    """
+    Detect SMT (Smart Money Technique) divergence between XAUUSD and DXY.
+
+    Because DXY is inversely correlated with gold:
+    - Bullish SMT: Gold makes a *lower* low while DXY does NOT confirm
+                   (DXY makes a higher low) → expect gold to reverse up.
+    - Bearish SMT: Gold makes a *higher* high while DXY does NOT confirm
+                   (DXY makes a lower high) → expect gold to reverse down.
+    """
+    if len(gold_df) < lookback * 2 or len(dxy_df) < lookback * 2:
+        return {
+            "type": "none",
+            "strength": "weak",
+            "message": "Insufficient data for SMT analysis",
+            "gold_high": 0.0,
+            "gold_low":  0.0,
+            "dxy_high":  0.0,
+            "dxy_low":   0.0,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+    gold_high      = float(gold_df["high"].iloc[-lookback:].max())
+    gold_low       = float(gold_df["low"].iloc[-lookback:].min())
+    dxy_high       = float(dxy_df["high"].iloc[-lookback:].max())
+    dxy_low        = float(dxy_df["low"].iloc[-lookback:].min())
+
+    prev_gold_high = float(gold_df["high"].iloc[-lookback * 2 : -lookback].max())
+    prev_gold_low  = float(gold_df["low"].iloc[-lookback * 2 : -lookback].min())
+    prev_dxy_high  = float(dxy_df["high"].iloc[-lookback * 2 : -lookback].max())
+    prev_dxy_low   = float(dxy_df["low"].iloc[-lookback * 2 : -lookback].min())
+
+    ts = datetime.now(timezone.utc).isoformat()
+
+    # Bullish SMT: gold lower low but DXY higher low (DXY not confirming weakness)
+    if gold_low < prev_gold_low and dxy_low > prev_dxy_low:
+        return {
+            "type":      "bullish",
+            "strength":  "strong",
+            "message":   "Gold making lower lows while DXY not confirming – bullish divergence",
+            "gold_high": round(gold_high, 2),
+            "gold_low":  round(gold_low, 2),
+            "dxy_high":  round(dxy_high, 4),
+            "dxy_low":   round(dxy_low, 4),
+            "timestamp": ts,
+        }
+
+    # Bearish SMT: gold higher high but DXY lower high (DXY not confirming strength)
+    if gold_high > prev_gold_high and dxy_high < prev_dxy_high:
+        return {
+            "type":      "bearish",
+            "strength":  "strong",
+            "message":   "Gold making higher highs while DXY not confirming – bearish divergence",
+            "gold_high": round(gold_high, 2),
+            "gold_low":  round(gold_low, 2),
+            "dxy_high":  round(dxy_high, 4),
+            "dxy_low":   round(dxy_low, 4),
+            "timestamp": ts,
+        }
+
+    return {
+        "type":      "none",
+        "strength":  "weak",
+        "message":   "No SMT divergence detected",
+        "gold_high": round(gold_high, 2),
+        "gold_low":  round(gold_low, 2),
+        "dxy_high":  round(dxy_high, 4),
+        "dxy_low":   round(dxy_low, 4),
+        "timestamp": ts,
+    }
+
+
+def detect_breaker_blocks(
+    obs: list[dict[str, Any]],
+    current_price: float,
+) -> list[dict[str, Any]]:
+    """
+    Identify Breaker Blocks – Order Blocks that have been violated by price.
+
+    When a *bullish* OB is broken to the downside the zone flips bearish.
+    When a *bearish* OB is broken to the upside the zone flips bullish.
+    Breaker Blocks tend to act as strong support/resistance on re-test.
+    """
+    breakers: list[dict[str, Any]] = []
+
+    for i, ob in enumerate(obs):
+        if ob["type"] == "bullish" and current_price < ob["price_low"]:
+            # Bullish OB breached → bearish breaker
+            breakers.append({
+                "id":             f"brk_{i}",
+                "type":           "bearish",
+                "price_high":     ob["price_high"],
+                "price_low":      ob["price_low"],
+                "price_mid":      ob["price_mid"],
+                "strength":       "high",
+                "timestamp":      ob["timestamp"],
+                "converted_from": "bullish_ob",
+            })
+        elif ob["type"] == "bearish" and current_price > ob["price_high"]:
+            # Bearish OB breached → bullish breaker
+            breakers.append({
+                "id":             f"brk_{i}",
+                "type":           "bullish",
+                "price_high":     ob["price_high"],
+                "price_low":      ob["price_low"],
+                "price_mid":      ob["price_mid"],
+                "strength":       "high",
+                "timestamp":      ob["timestamp"],
+                "converted_from": "bearish_ob",
+            })
+
+    return breakers
+
+
 def compute_confluence_score(
     structure: dict,
     obs: list[dict],
@@ -519,16 +675,20 @@ def compute_confluence_score(
     liquidity: list[dict],
     session: dict,
     mtf_trends: list[str],
+    smt: Optional[dict] = None,
 ) -> dict[str, Any]:
     """
-    Calculate a 10-point confluence score.
+    Calculate a 12-point confluence score.
 
     Breakdown:
       - Multi-timeframe alignment  : 0-3 pts  (how many TFs agree)
       - Order Block confluence     : 0-2 pts  (active untested OBs near price)
       - Fair Value Gap             : 0-2 pts  (unfilled FVG near price)
       - Liquidity sweep            : 0-2 pts  (recent liquidity taken)
+      - SMT divergence             : 0-2 pts  (correlated-asset divergence)
       - Kill Zone timing           : 0-1 pt   (inside London/NY kill zone)
+                                     ------
+                                     12 pts maximum
 
     Signal fires when total >= 7.
     """
@@ -556,12 +716,16 @@ def compute_confluence_score(
     liq_score   = min(2, len(swept_zones))
     breakdown["liquidity_sweep"] = liq_score
 
+    # --- SMT divergence (max 2 pts) ---
+    smt_score = 2 if (smt and smt.get("type") != "none") else 0
+    breakdown["smt_divergence"] = smt_score
+
     # --- Kill Zone (1 pt) ---
     kz_score = 1 if session["in_kill_zone"] else 0
     breakdown["kill_zone"] = kz_score
 
     total    = sum(breakdown.values())
-    max_score = 10
+    max_score = 12
 
     if total >= 8:
         rating = "Strong"
@@ -588,6 +752,7 @@ def generate_signal(
     liquidity: list[dict],
     confluence: dict,
     session: dict,
+    smt: Optional[dict] = None,
 ) -> dict[str, Any]:
     """
     Generate a trading signal (BUY / SELL / NEUTRAL) with entry, SL, and TP levels.
@@ -630,7 +795,10 @@ def generate_signal(
     if bear_fvgs:
         reasons.append(f"{len(bear_fvgs)} unfilled bearish Fair Value Gap(s)")
 
-    reasons.append(f"Confluence score: {score}/10 ({confluence['rating']})")
+    if smt and smt.get("type") != "none":
+        reasons.append(f"SMT divergence: {smt['message']}")
+
+    reasons.append(f"Confluence score: {score}/{confluence['max_score']} ({confluence['rating']})")
 
     # Only fire signal when score threshold is met
     if score < 7:
@@ -801,7 +969,7 @@ def get_session() -> SessionResponse:
 def get_current_signal() -> SignalResponse:
     """
     Generate and return the current trading signal with full ICT analysis.
-    A signal fires only when the 10-point confluence score is >= 7.
+    A signal fires only when the 12-point confluence score is >= 7.
     """
     # Use 1h for primary analysis
     df       = fetch_ohlc(period="30d", interval="1h")
@@ -815,8 +983,16 @@ def get_current_signal() -> SignalResponse:
     df_daily = fetch_ohlc(period="1y", interval="1d")
     mtf_trends = [structure["trend"], analyze_market_structure(df_daily)["trend"]]
 
-    confluence = compute_confluence_score(structure, obs, fvgs, liq, session, mtf_trends)
-    signal     = generate_signal(df, structure, obs, fvgs, liq, confluence, session)
+    # SMT divergence using DXY (best-effort; skip on data error)
+    smt: Optional[dict] = None
+    try:
+        dxy_df = fetch_ohlc_ticker(DXY_TICKER, period="30d", interval="1h")
+        smt = detect_smt_divergence(df, dxy_df)
+    except Exception as exc:
+        logger.warning("SMT divergence skipped (DXY unavailable): %s", exc)
+
+    confluence = compute_confluence_score(structure, obs, fvgs, liq, session, mtf_trends, smt)
+    signal     = generate_signal(df, structure, obs, fvgs, liq, confluence, session, smt)
 
     _record_signal(signal)
     return SignalResponse(**signal)
@@ -900,7 +1076,7 @@ def get_mtf_analysis() -> list[MTFAnalysis]:
 
 @app.get("/api/v1/analysis/confluence-score", response_model=ConfluenceScore, tags=["Analysis"])
 def get_confluence() -> ConfluenceScore:
-    """Return the current 10-point confluence score breakdown."""
+    """Return the current 12-point confluence score breakdown."""
     df        = fetch_ohlc(period="30d", interval="1h")
     session   = get_current_session()
     obs       = detect_order_blocks(df)
@@ -909,5 +1085,50 @@ def get_confluence() -> ConfluenceScore:
     structure = analyze_market_structure(df)
     df_daily  = fetch_ohlc(period="1y", interval="1d")
     mtf_trends = [structure["trend"], analyze_market_structure(df_daily)["trend"]]
-    confluence = compute_confluence_score(structure, obs, fvgs, liq, session, mtf_trends)
+
+    smt: Optional[dict] = None
+    try:
+        dxy_df = fetch_ohlc_ticker(DXY_TICKER, period="30d", interval="1h")
+        smt = detect_smt_divergence(df, dxy_df)
+    except Exception as exc:
+        logger.warning("SMT divergence skipped (DXY unavailable): %s", exc)
+
+    confluence = compute_confluence_score(structure, obs, fvgs, liq, session, mtf_trends, smt)
     return ConfluenceScore(**confluence)
+
+
+@app.get("/api/v1/ict/smt-divergence", response_model=SMTDivergenceResponse, tags=["ICT"])
+def get_smt_divergence(
+    lookback: int = Query(default=10, ge=5, le=50,
+                          description="Number of candles to compare for divergence")
+) -> SMTDivergenceResponse:
+    """
+    Detect SMT (Smart Money Technique) divergence between XAUUSD and DXY.
+
+    Bullish SMT: Gold makes lower low while DXY does not confirm → gold reversal up likely.
+    Bearish SMT: Gold makes higher high while DXY does not confirm → gold reversal down likely.
+    """
+    gold_df = fetch_ohlc(period="30d", interval="1h")
+    dxy_df  = fetch_ohlc_ticker(DXY_TICKER, period="30d", interval="1h")
+    result  = detect_smt_divergence(gold_df, dxy_df, lookback=lookback)
+    return SMTDivergenceResponse(**result)
+
+
+@app.get("/api/v1/ict/breaker-blocks", tags=["ICT"])
+def get_breaker_blocks(
+    timeframe: str = Query(default="1h")
+) -> list[BreakerBlock]:
+    """
+    Return Breaker Blocks – violated Order Blocks that have flipped polarity.
+
+    A bullish OB that price breaks below becomes a bearish breaker block.
+    A bearish OB that price breaks above becomes a bullish breaker block.
+    """
+    if timeframe not in TIMEFRAME_MAP:
+        raise HTTPException(status_code=400, detail=f"Unknown timeframe: {timeframe}")
+    period, interval = TIMEFRAME_MAP[timeframe]
+    df            = fetch_ohlc(period=period, interval=interval)
+    obs           = detect_order_blocks(df)
+    current_price = float(df["close"].iloc[-1])
+    breakers      = detect_breaker_blocks(obs, current_price)
+    return [BreakerBlock(**b) for b in breakers]
