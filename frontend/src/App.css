@@ -509,7 +509,7 @@ html, body, #root {
 .tag.ssl    { background: rgba(239,68,68,0.15);   color: var(--bear); }
 .tag.strong { background: rgba(245,158,11,0.15);  color: var(--gold); }
 .tag.moderate{ background: rgba(148,163,184,0.1); color: var(--text-muted); }
-.tag.filled | .tag.tested | .tag.swept { 
+.tag.filled, .tag.tested, .tag.swept { 
   background: rgba(107,114,128,0.15); 
   color: var(--text-muted); 
   text-decoration: line-through; 
